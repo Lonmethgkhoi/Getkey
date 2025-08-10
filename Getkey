@@ -1,0 +1,377 @@
+// Cloudflare Worker - FULL, LONG, GET-only, anti-bypass, direct-configurable, one-way HMAC storage
+// Bind these KV namespaces in Worker settings (exact names used below):
+//   - KEYSTORE    (sessions, issued-times, stored HMACs)
+//   - BLACKLIST   (blacklist by session or IP)
+//   - LOGS        (optional event logs)
+// Set environment var SECRET_KEY to a strong secret (used for HMAC).
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname || "/";
+    const method = request.method.toUpperCase();
+
+    // ========================
+    // CONFIG - Edit as needed
+    // ========================
+    const CONFIG = {
+      DIRECT_LINK: "https://link-center.net/1261305/A3A172twuaxO", // direct ad link
+      ALLOWED_REF_DOMAINS: ["link-center.net", "linkvertise.com"], // allowed referrer domains (partial match)
+      SESSION_TTL_SEC: 24 * 60 * 60,       // session lifetime (seconds)
+      HMAC_TTL_SEC: 24 * 60 * 60,          // stored HMAC lifetime (seconds)
+      BLACKLIST_TTL_SEC: 24 * 60 * 60,     // blacklist duration (seconds)
+      KEY_LENGTH: 48,                      // plaintext key length
+      RATE_LIMIT_TTL_SEC: 10,              // per-IP throttling small window (seconds)
+      RATE_LIMIT_MAX: 5,                   // max requests per window (very soft)
+      RETURN_PLAINTEXT_KEY: true,          // worker returns plaintext key (client must keep it); HMAC kept server-side
+      LOG_TTL_SEC: 7 * 24 * 60 * 60        // logs TTL
+    };
+
+    // KV bindings
+    const KV = env.KEYSTORE;
+    const KV_BLACKLIST = env.BLACKLIST;
+    const KV_LOGS = env.LOGS;
+    const SECRET = env.SECRET_KEY || ""; // must set in Worker environment
+
+    // ========================
+    // Helpers
+    // ========================
+    function jsonResponse(obj, status = 200) {
+      return new Response(JSON.stringify(obj, null, 2), {
+        status,
+        headers: {
+          "Content-Type": "application/json;charset=utf-8",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    function textResponse(text, status = 200) {
+      return new Response(text, { status, headers: { "Content-Type": "text/plain;charset=utf-8" } });
+    }
+
+    function nowTs() {
+      return Date.now();
+    }
+
+    function shortId() {
+      // small readable id for logs
+      return Math.random().toString(36).slice(2, 10);
+    }
+
+    function includesAny(haystack, list) {
+      if (!haystack) return false;
+      for (let i = 0; i < list.length; i++) {
+        if (haystack.includes(list[i])) return true;
+      }
+      return false;
+    }
+
+    function randAlphaNumeric(len) {
+      const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+      const arr = new Uint32Array(len);
+      crypto.getRandomValues(arr);
+      let out = "";
+      for (let i = 0; i < len; i++) out += chars[arr[i] % chars.length];
+      return out;
+    }
+
+    function b64FromBuffer(buf) {
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    async function computeHMAC(secret, message) {
+      const enc = new TextEncoder();
+      const keyData = enc.encode(secret);
+      const msgData = enc.encode(message);
+      const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        keyData,
+        { name: "HMAC", hash: { name: "SHA-256" } },
+        false,
+        ["sign"]
+      );
+      const sig = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+      return b64FromBuffer(sig);
+    }
+
+    async function kvLog(tag, data = {}) {
+      try {
+        if (!KV_LOGS) return;
+        const key = `log:${Date.now()}:${shortId()}`;
+        const payload = { tag, ts: new Date().toISOString(), ...data };
+        await KV_LOGS.put(key, JSON.stringify(payload), { expirationTtl: CONFIG.LOG_TTL_SEC });
+      } catch (e) {
+        // ignore logging errors
+      }
+    }
+
+    // blacklist helpers (session & ip)
+    async function isBlacklistedSession(session) {
+      if (!KV_BLACKLIST) return false;
+      try {
+        const v = await KV_BLACKLIST.get(`s:${session}`);
+        return v !== null;
+      } catch (e) {
+        return false;
+      }
+    }
+    async function isBlacklistedIp(ip) {
+      if (!KV_BLACKLIST) return false;
+      try {
+        const v = await KV_BLACKLIST.get(`i:${ip}`);
+        return v !== null;
+      } catch (e) {
+        return false;
+      }
+    }
+    async function addBlacklist(session, ip, reason = "manual") {
+      try {
+        if (KV_BLACKLIST) {
+          if (session) await KV_BLACKLIST.put(`s:${session}`, "1", { expirationTtl: CONFIG.BLACKLIST_TTL_SEC });
+          if (ip) await KV_BLACKLIST.put(`i:${ip}`, "1", { expirationTtl: CONFIG.BLACKLIST_TTL_SEC });
+        }
+        await kvLog("blacklist_add", { session, ip, reason });
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // rate-limit simple per-IP counter
+    async function allowRequestIP(ip) {
+      if (!KV) return true;
+      try {
+        const key = `rl:${ip}`;
+        const val = await KV.get(key);
+        if (!val) {
+          // set count = 1 with TTL
+          await KV.put(key, "1", { expirationTtl: CONFIG.RATE_LIMIT_TTL_SEC });
+          return true;
+        } else {
+          const n = Number(val) || 0;
+          if (n >= CONFIG.RATE_LIMIT_MAX) return false;
+          await KV.put(key, String(n + 1), { expirationTtl: CONFIG.RATE_LIMIT_TTL_SEC });
+          return true;
+        }
+      } catch (e) {
+        // if KV errors, fail-open
+        return true;
+      }
+    }
+
+    // ========================
+    // Endpoint logic
+    // ========================
+    try {
+      // get client ip + referer + ua
+      const clientIP = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+      const referer = request.headers.get("referer") || "";
+      const ua = request.headers.get("user-agent") || "";
+
+      // -- direct redirect endpoint
+      if (path === "/direct") {
+        await kvLog("direct", { ip: clientIP, ua, referer });
+        return Response.redirect(CONFIG.DIRECT_LINK, 302);
+      }
+
+      // -- start-session : allow GET or POST (we accept GET per earlier discussions)
+      if (path === "/start-session") {
+        // create session and store
+        const sessionID = crypto.randomUUID();
+        await KV.put(`session:${sessionID}`, "active", { expirationTtl: CONFIG.SESSION_TTL_SEC });
+        await kvLog("session_create", { sessionID, ip: clientIP, ua });
+        return jsonResponse({ success: true, session: sessionID, link: CONFIG.DIRECT_LINK });
+      }
+
+      // -- verify endpoint (issue a short token without storing plaintext)
+      // GET /verify?ref=<referrer>
+      if (path === "/verify") {
+        const ref = url.searchParams.get("ref") || "";
+        const ok = includesAny(ref, CONFIG.ALLOWED_REF_DOMAINS);
+        if (!ok) {
+          await kvLog("verify_fail", { reason: "bad_ref", ref, ip: clientIP });
+          return jsonResponse({ success: false, error: "Referrer not allowed" }, 403);
+        }
+        // issue short token (session-like but stateless token with expiry stored)
+        const token = crypto.randomUUID() + "-" + Date.now().toString(36);
+        // store token as session substitution
+        await KV.put(`session:${token}`, "active", { expirationTtl: CONFIG.SESSION_TTL_SEC });
+        await kvLog("verify_success", { token, ref, ip: clientIP });
+        return jsonResponse({ success: true, token });
+      }
+
+      // -- getkey endpoint: requires session param and referer check
+      // GET /getkey?session=<session>
+      if (path === "/getkey") {
+        const session = url.searchParams.get("session") || "";
+        if (!session) {
+          await kvLog("getkey_fail", { reason: "missing_session", ip: clientIP, referer });
+          return jsonResponse({ error: "Missing session parameter" }, 400);
+        }
+
+        // blacklist checks
+        if (await isBlacklistedSession(session) || await isBlacklistedIp(clientIP)) {
+          await kvLog("getkey_reject", { reason: "blacklisted", session, ip: clientIP });
+          return jsonResponse({ error: "Access denied (blacklisted)" }, 403);
+        }
+
+        // validate session exists
+        const sessionVal = await KV.get(`session:${session}`);
+        if (!sessionVal) {
+          await kvLog("getkey_fail", { reason: "invalid_session", session, ip: clientIP, referer });
+          return jsonResponse({ error: "Invalid or expired session" }, 403);
+        }
+
+        // referer must include one of allowed domains (worker double-check)
+        if (!includesAny(referer, CONFIG.ALLOWED_REF_DOMAINS)) {
+          // treat as bypass, blacklist
+          await addBlacklist(session, clientIP, "bad_referer_on_getkey");
+          return jsonResponse({ error: "Bypass detected. You have been blacklisted." }, 403);
+        }
+
+        // rate-limit quick check
+        const okRate = await allowRequestIP(clientIP);
+        if (!okRate) {
+          await kvLog("getkey_rate_limited", { session, ip: clientIP });
+          return jsonResponse({ error: "Rate limited. Try again later." }, 429);
+        }
+
+        // check if HMAC already exists for this session -> optional behavior: overwrite or return same
+        // We'll overwrite with new issuance each time (server stores only HMAC).
+        // generate plaintext key
+        const plainKey = randAlphaNumeric(CONFIG.KEY_LENGTH);
+
+        // compute HMAC one-way using SECRET (must be configured)
+        if (!SECRET || SECRET.length < 4) {
+          await kvLog("getkey_fail", { reason: "no_secret", session, ip: clientIP });
+          return jsonResponse({ error: "Server misconfiguration" }, 500);
+        }
+        const hmac = await computeHMAC(SECRET, plainKey);
+
+        // store only HMAC and issued time (no plaintext)
+        await KV.put(`hmac:${session}`, hmac, { expirationTtl: CONFIG.HMAC_TTL_SEC });
+        await KV.put(`issued:${session}`, String(Date.now()), { expirationTtl: CONFIG.HMAC_TTL_SEC });
+
+        await kvLog("getkey_success", { session, ip: clientIP, ua });
+
+        // Return the plaintext key to the client (client must keep it secret).
+        // If you prefer to return encrypted string, you can change here to encrypt before returning.
+        if (CONFIG.RETURN_PLAINTEXT_KEY) {
+          return jsonResponse({ key: plainKey, note: "Key delivered; server keeps only one-way HMAC." });
+        } else {
+          // alternative: return only a message (not plaintext)
+          return jsonResponse({ delivered: true });
+        }
+      }
+
+      // -- verify-key endpoint: client submits key to verify against stored HMAC
+      // GET /verify-key?session=...&key=...
+      if (path === "/verify-key") {
+        const session = url.searchParams.get("session") || "";
+        const presentedKey = url.searchParams.get("key") || "";
+        if (!session || !presentedKey) {
+          return jsonResponse({ ok: false, error: "Missing session or key" }, 400);
+        }
+        // blacklisted?
+        if (await isBlacklistedSession(session) || await isBlacklistedIp(clientIP)) {
+          await kvLog("verify_blocked", { session, ip: clientIP });
+          return jsonResponse({ ok: false, error: "Blacklisted" }, 403);
+        }
+        const storedHmac = await KV.get(`hmac:${session}`);
+        if (!storedHmac) {
+          await kvLog("verify_fail", { reason: "no_hmac", session, ip: clientIP });
+          return jsonResponse({ ok: false, error: "No key stored for session" }, 404);
+        }
+        // compute hmac of presented key
+        if (!SECRET || SECRET.length < 4) {
+          return jsonResponse({ ok: false, error: "Server misconfigured" }, 500);
+        }
+        const presentedHmac = await computeHMAC(SECRET, presentedKey);
+        // constant time compare
+        let equal = true;
+        if (presentedHmac.length !== storedHmac.length) {
+          equal = false;
+        } else {
+          let res = 0;
+          for (let i = 0; i < presentedHmac.length; i++) res |= presentedHmac.charCodeAt(i) ^ storedHmac.charCodeAt(i);
+          equal = (res === 0);
+        }
+        if (equal) {
+          await kvLog("verify_success", { session, ip: clientIP });
+          return jsonResponse({ ok: true });
+        } else {
+          await kvLog("verify_fail", { session, ip: clientIP });
+          return jsonResponse({ ok: false, error: "Invalid key" }, 403);
+        }
+      }
+
+      // -- status/info endpoint
+      if (path === "/status") {
+        return jsonResponse({
+          ok: true,
+          ts: new Date().toISOString(),
+          direct: CONFIG.DIRECT_LINK,
+          allowed_ref_domains: CONFIG.ALLOWED_REF_DOMAINS
+        });
+      }
+
+      // default page (small info)
+      return textResponse("Worker alive. Use /start-session, /verify?ref=..., /getkey?session=..., /verify-key?session=...&key=...");
+    } catch (err) {
+      try { await kvLog("error_unhandled", { message: String(err) }); } catch (e) {}
+      return jsonResponse({ error: "Internal Server Error", detail: String(err) }, 500);
+    }
+  }
+};
+
+// ========================
+// Note: helper functions used above are defined here for completeness
+// (they are accessible because of function hoisting in this single-file worker)
+async function computeHMAC(secret, message) {
+  const enc = new TextEncoder();
+  const keyData = enc.encode(secret);
+  const msgData = enc.encode(message);
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: { name: "SHA-256" } },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  return b64FromBuffer(sig);
+}
+
+function b64FromBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function includesAny(haystack, list) {
+  if (!haystack) return false;
+  for (let i = 0; i < list.length; i++) {
+    if (haystack.includes(list[i])) return true;
+  }
+  return false;
+}
+
+function randAlphaNumeric(len) {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const arr = new Uint32Array(len);
+  crypto.getRandomValues(arr);
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[arr[i] % chars.length];
+  return out;
+}
+```0
